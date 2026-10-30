@@ -1,97 +1,104 @@
 # Time Series Forecasting: An Honest Benchmark
 
 > [!NOTE]
-> **Project Status:** Work in progress. Benchmarks, backtesting runs, and the live demo are actively being developed and updated.
+> **Project Status:** Active empirical benchmark across three self-contained Polars + PyTorch/Nixtla notebooks (`UCI-Bike-Sharing.ipynb`, `Electricity-Load.ipynb`, `M5-Forecasting.ipynb`). Design specification: [`docs/superpowers/specs/2026-10-30-honest-benchmark-design.md`](docs/superpowers/specs/2026-10-30-honest-benchmark-design.md).
 
 ---
 
 ## The Big Picture: When Baselines Win and When They Don't
 
-The main question behind this project is simple: do we actually need complex deep learning models for time series, or do basic baselines do the job just as well for a fraction of the cost? 
+The central question behind this repository is practical: **when do complex neural architectures and pretrained foundation models genuinely beat classical statistical methods and gradient boosted trees, and at what compute cost?**
 
-In practice, simple baselines win when data has clean, predictable seasonality and a single repeating cycle. If you are forecasting a regular hourly or daily pattern with low noise over short horizons, Seasonal Naive or a simple ensemble of ETS, Theta, and ARIMA will often match or beat a neural network. They are fast, reliable, run in milliseconds on CPU, and cannot overfit.
+In practice:
+- **Strong statistical and linear baselines** (`MSTL`, `AutoARIMA`, `AutoETS`, `AutoTheta`, `RidgeCV`) are tough to beat when demand follows stable repeating cycles and historical memory is clean. They train in seconds on CPU, require minimal operational upkeep, and provide transparent trend/seasonal components.
+- **Gradient Boosted Decision Trees** (`LightGBM`, `XGBoost`, `CatBoost`) excel on single and tabularized series when engineered autoregressive lags, rolling statistics, calendar harmonics, and external drivers (weather, holidays, SNAP schedules) interact non-linearly.
+- **Sequence deep learning and foundation models** (`DLinear`, `PatchTST`, `NBEATSx`, `NHITS`, `Chronos-Bolt`) earn their keep when multi-rate temporal patterns, long lookback horizons, or zero-shot cold-start requirements outweigh GPU training and inference overhead.
 
-Complex models pull ahead when two things happen: cross-series learning and rich external drivers. When you have thousands of related items like in retail demand (such as the M5 dataset), models like LightGBM or deep architectures can learn shared patterns across the entire catalog that no single-series model can catch. They also shine when predictions rely heavily on external variables like weather, prices, or marketing promotions, and when data has multiple overlapping seasons (like hourly electricity demand with both daily and weekly rhythms).
-
-For engineering and data science teams, this benchmark provides a practical rule of thumb: always start with simple baselines. If a complex neural model is only two percent better but takes fifty times longer to train and requires a dedicated GPU in production, it is rarely worth the maintenance headache.
+For engineering teams, the takeaway is simple: benchmark strong statistical and GBDT baselines under strict leak-free rules before deploying heavy neural pipelines.
 
 ---
 
-## Why This Benchmark Matters
+## How This Benchmark Defines Fairness
 
-Time series research is full of exciting new deep learning architectures and foundation models. Yet practical industry papers—including the LTSF-Linear critique—regularly show that simple linear baselines often beat multi-layer Transformers when tested properly.
+Time series comparisons often fail in one of two ways: either classical baselines are run with naive defaults (`SARIMAX(1,1,1)` or free-running multi-step rollouts pitted against 1-step teacher-forced neural nets), or benchmarks claim *"every model gets the exact same feature matrix and tuning budget"* — an impossible standard across fundamentally different paradigms. Feeding a 15-column tabular lag/calendar vector into `DLinear` or `PatchTST` breaks sequence pooling, just as stripping lag features cripples `LightGBM`.
 
-A major reason for this gap is benchmark bias. In many academic comparisons, complex neural models receive extensive hyperparameter tuning, GPU compute, and carefully engineered features, while classical baselines are run with out-of-the-box defaults. This project levels the playing field: every model gets the exact same feature inputs, the same tuning budget, and the same evaluation setup.
+Instead, this benchmark enforces **four concrete fairness invariants** across every notebook:
+
+1. **Identical Causal Information Cutoff ($\mathcal{F}_{t-1}$):**  
+   When predicting target $y_t$ at any test step $t$, every model observes target history strictly up to $t-1$ plus causally valid calendar/exogenous covariates, with **zero parameter refitting** on the test split (`refit=False` 1-step-ahead rolling evaluation). Statistical state-space models update their Kalman/smoothing state with $y_{t-1}$ via `.forward()` rather than decaying across a blind multi-month forecast, matching the $y_{t-1}$ lag/context access of GBDTs, neural sequence models, and `Chronos-Bolt`.
+2. **Paradigm-Native Input Representations:**  
+   Every model family consumes $\mathcal{F}_{t-1}$ in the representation it was designed for:
+   - *Statistical decomposition & state-space (`statsforecast`):* Raw continuous series $y$ with native seasonal cycle lengths (plus exogenous regressors $X$ for `AutoARIMA`).
+   - *Regularized linear & GBDTs:* Leak-free autoregressive lags, shifted rolling statistics (`shift(1)` prior to windowing), cyclical trigonometric calendar encodings, and exogenous covariates.
+   - *Sequence deep learning (`neuralforecast`):* Contiguous raw chronological lookback windows $y_{t-L:t-1}$ (`L=168` hourly / `L=56` daily), plus `futr_exog_list` covariates on exogenous-capable architectures (`NBEATSx`, `NHITS`).
+   - *Zero-shot foundation (`Chronos-Bolt`):* Raw univariate context windows $y_{t-512:t-1}$.
+3. **Strict Three-Way Chronological Split (`70% train / 15% val / 15% test`):**  
+   `val_df` is reserved strictly for iterative early stopping (`LightGBM`, `XGBoost`, `CatBoost`, `NeuralForecast`) and `RidgeCV` regularization selection. **All leaderboard metrics are reported exclusively on the untouched final 15% `test_df`**, preventing early-stopping validation leakage while allowing every model to observe history right up to the `val_df` $\rightarrow$ `test_df` boundary.
+4. **Disclosed Selection Protocols Under a 120s Per-Model Budget:**  
+   Rather than asymmetric manual grid tuning, each tier uses its standard automated selection mechanism:
+   - `AutoARIMA`: Hyndman–Khandakar stepwise AICc search over $(p, d, q)(P, D, Q)_s$ on pre-test history, logging the exact selected order.
+   - `AutoETS` / `AutoTheta` / `MSTL`: Maximum-likelihood state-space selection and multi-seasonal LOESS decomposition on pre-test history.
+   - `RidgeCV`: Closed-form generalized cross-validation over `alphas=[0.1, 1.0, 10.0, 100.0]`.
+   - `GBDTs`: Standardized capacity (`n_estimators=1000`, `learning_rate=0.03`, `num_leaves=31` / `max_depth=6`) with `early_stopping_rounds=30` monitored on `val_df`.
+   - `NeuralForecast`: Standardized optimizer/step budget (`max_steps=500`, `val_check_steps=25`, `early_stop_patience_steps=3` on `val_df`).
+   - `Chronos-Bolt`: Out-of-the-box zero-shot inference (`amazon/chronos-bolt-tiny`, zero fine-tuning).
 
 ---
 
 ## Datasets
 
-This benchmark uses three datasets that reflect very different real-world challenges.
+Each dataset is implemented as a standalone, reproducible notebook using `Polars` for leak-free temporal preprocessing:
 
-The M5 Walmart Competition dataset covers daily retail sales across thousands of products. It is dominated by intermittent demand, promotions, price changes, and lots of zeros. It tests how well models handle sparse data, hierarchical structures, and cross-series learning.
-
-The Electricity Load dataset tracks continuous hourly power consumption over several years. It features strong multiple seasonalities, including daily routines, workweek versus weekend differences, and seasonal temperature swings.
-
-The Bike Sharing dataset tracks hourly bike rentals alongside continuous weather measurements like temperature, humidity, and wind speed. It tests how effectively models use external drivers to improve forecast accuracy.
-
----
-
-## Model Lineup Across Three Tiers
-
-To make the comparison fair, models are grouped into three distinct tiers rather than just pitting naive methods directly against massive neural nets.
-
-### Simple Baselines
-This tier sets the minimum performance standard that any useful model must beat. It includes Seasonal Naive and an equally weighted ensemble of classic statistical methods: ETS, Theta, and AutoARIMA. These run quickly on any laptop and give a fast sanity check on basic trends and seasonal cycles.
-
-### Strong Statistical Models
-Comparing basic ARIMA or ETS to neural networks on hourly data is fundamentally unfair because standard ARIMA and ETS only handle a single seasonal period (a point emphasized by Christoph Bergmeir). To fix this, this tier includes models built specifically for multiple seasonalities: MSTL (Multiple Seasonal-Trend decomposition using LOESS), TBATS, and Dynamic Harmonic Regression using ARIMA with Fourier terms.
-
-### Machine Learning and Deep Learning
-This tier includes gradient boosting and modern neural architectures. LightGBM is trained with calendar encodings and rolling lag features. Prophet is included for decomposable trend-season modeling. For neural approaches, the benchmark tests N-BEATS and NHITS for hierarchical basis expansion, DLinear and NLinear to test simple linear projections against attention mechanisms, and a lightweight Temporal Transformer. Pre-trained zero-shot foundation models such as Chronos and TimesFM are also evaluated.
+1. **UCI Capital Bikeshare (`UCI-Bike-Sharing.ipynb`):**  
+   `17,376` continuous hourly observations (2011–2012) of Washington, D.C. bike rentals (`cnt`). Missing hourly timestamps are reconstructed and imputed strictly from causal expanding weekday-hour historical means (zero future leakage), paired with meteorological drivers (`temp`, `atemp`, `hum`, `windspeed`, `weathersit`) and holiday/workday flags.
+2. **Portuguese Electricity Load (`Electricity-Load.ipynb`):**  
+   `26,136` continuous hourly observations (2012–2015) of aggregate active power demand (`load` in kW) from the UCI / Monash Electricity Load archive. Tests overlapping diurnal ($s_1=24$) and weekly ($s_2=168$) seasonalities.
+3. **M5 Walmart National Retail Demand (`M5-Forecasting.ipynb`):**  
+   `1,913` continuous daily observations (2011–2016) of aggregated U.S. Walmart unit sales (`national_sales`) enriched with state SNAP benefit schedules and weekly/monthly cycles ($s_1=7, s_2=28$). *(Note: This notebook benchmarks continuous aggregate retail volume and exogenous SNAP effects; item-level intermittent 30,490-series hierarchical WRMSSE is tracked under Planned Extensions.)*
 
 ---
 
-## Evaluation Strategy and Practical Metrics
+## Four-Tier Model Lineup (17 Standardized Models)
 
-Evaluating time series requires strict rules to avoid leaking future data into the past.
+Every notebook evaluates the exact same 17 models across four architectural tiers:
 
-Every model is tested using expanding-window backtesting across rolling forecast origins. Standard random k-fold cross-validation is strictly avoided because shuffling time series records leaks future information into the training set, giving artificially optimistic results that fail in production.
+### Tier 1: Classical & Multi-Seasonal Statistical Models (`statsforecast` + `scikit-learn`)
+- **Parameter-Free Baselines:** `Naive (t-1)`, `Smoothed Naive (2-Step)`, and dual `Seasonal Naive` (`t-24` & `t-168` hourly; `t-7` & `t-28` daily) setting the minimum accuracy floor.
+- **Regularized Linear:** `RidgeCV` with `StandardScaler` and median imputation over engineered lag/calendar/exogenous features.
+- **State-Space & Multi-Seasonal Statistical (`Nixtla StatsForecast`):**
+  - `AutoETS` and `AutoTheta` (`season_length=s1`) for exponential smoothing and Theta decomposition.
+  - `MSTL` (`season_length=[s1, s2]` with `AutoETS("ZZN")` trend forecaster) to handle overlapping diurnal/weekly and weekly/monthly cycles (addressing the single-seasonality limitation highlighted by Bergmeir et al.).
+  - `AutoARIMA` (`season_length=s1` + dataset exogenous covariates) selected via stepwise AICc and rolled 1-step-ahead via state-space forward filtering (`refit=False`).
 
-Metrics are chosen based on the distribution of each dataset. For M5, performance is measured using Root Mean Squared Scaled Error (RMSSE) and Weighted RMSSE (WRMSSE), the competition's official metrics. Standard metrics like sMAPE are avoided on M5 because dividing by near-zero values distorts the score when demand is intermittent. For electricity load and bike sharing, models are evaluated using MASE and sMAPE to balance scale invariance with easy business interpretation.
+### Tier 2: Tabular Gradient Boosted Decision Trees
+- `LightGBM Regressor` (GOSS/histogram leaf-wise trees), `XGBoost Regressor` (`tree_method="hist"` depth-wise trees), and `CatBoost Regressor` (symmetric oblivious trees), all regularized via validation early stopping on `val_df`.
 
-To confirm that small differences between models are real rather than random luck, model rankings are backed by Diebold-Mariano tests and Friedman-Nemenyi critical difference diagrams. Every run also tracks practical production costs: training time, inference latency, memory footprint, and required hardware.
+### Tier 3: Sequence Deep Learning (`Nixtla NeuralForecast`)
+- `DLinear` (*Zeng et al., AAAI 2023*): Moving-average trend/seasonal decomposition with independent linear projections on raw univariate lookback windows.
+- `PatchTST` (*Nie et al., ICLR 2023*): Channel-independent subseries patching Transformer on raw univariate lookback windows.
+- `NBEATSx` (*Olivares et al., IJF 2023*): Doubly-residual neural basis expansion incorporating exogenous calendar/weather/SNAP covariates (`futr_exog_list`).
+- `NHITS` (*Challu et al., AAAI 2023*): Multi-rate hierarchical pooling and temporal interpolation with exogenous covariates (`futr_exog_list`).
 
----
+### Tier 4: Zero-Shot Time-Series Foundation Model
+- `Amazon Chronos-Bolt` (`amazon/chronos-bolt-tiny`, ~9M parameters, *Ansari et al., 2024*): Patch-tokenized zero-shot median quantile forecasts over rolling 512-step historical contexts.
 
-## Diagnostic Experiments
-
-Beyond standard leaderboards, this project runs targeted experiments to uncover how models actually behave under the hood.
-
-### Error by Forecast Horizon
-Forecast accuracy naturally drops as the prediction window gets longer. By tracking error from one hour out to several days, these experiments show where each model's curve converges to Seasonal Naive. That convergence point marks the empirical limit of forecastability, showing exactly where extra model complexity stops helping.
-
-### Lookback Window Sensitivity
-Instead of picking an arbitrary historical window like 96 steps, the benchmark tests models across varying lookback lengths. Plotting error against lookback depth tests the LTSF-Linear finding: checking whether linear models continue to improve with longer histories while Transformers plateau or overfit.
-
-### Input Shuffling Test
-To test whether deep sequence models actually use chronological order, an ablation test feeds randomly shuffled input windows to trained models. If a complex neural model performs just as well on shuffled data as it does on ordered data, it is acting like a basic regression model rather than truly understanding temporal structure.
-
-### Data Leakage Demonstration
-To show why proper backtesting matters, this experiment benchmarks the same models under both random cross-validation and rolling-origin backtesting. The difference in error scores gives a clear demonstration of how temporal leakage creates misleading benchmark claims.
-
----
-
-## Foundation Models and Extra Analyses
-
-To keep the study relevant for modern engineering workflows, the benchmark explores several practical extensions.
-
-Zero-shot foundation models like Chronos and TimesFM are tested straight out of the box, with careful checks for pretraining contamination on public datasets like electricity load. Top-performing models are evaluated on prediction intervals and quantile loss to gauge uncertainty rather than just point forecasts. Systematic failure cases around holidays and anomalous events are broken down, alongside feature importance for LightGBM and component breakdowns for ETS. Finally, compute-versus-accuracy plots map out the actual trade-off between cloud costs and forecast quality.
+### Architectural Scope Boundaries
+To keep notebook runtimes practical (<3 minutes on a Colab T4 GPU) while covering the modern Pareto frontier, two architecture families are intentionally omitted from the core notebooks:
+- **`DeepAR` / `DeepState` (Amazon Research / GluonTS):** Sometimes conflated with the Meta Prophet or PyMC ecosystems, `DeepAR` and `DeepState` are GluonTS probabilistic autoregressive RNN / state-space models built for global cross-series training across thousands of disaggregate items. On single-series point-forecasting tasks, they introduce heavy dependency overhead without outperforming `NHITS`, `PatchTST`, or GBDTs.
+- **Temporal Convolutional Networks (`TCN`):** Dilated causal CNNs are an important historical sequence family, but in post-2023 forecasting benchmarks their multi-scale receptive field role is more effectively and efficiently represented by `NHITS` (multi-rate pooling) alongside `DLinear` and `PatchTST`.
 
 ---
 
-## Codebase and Deliverables
+## Metrics & Pretraining Contamination Disclosure
 
-The repository is built around reproducibility, clean structure, and practical engineering tools.
+- **Scale-Dependent & Scale-Free Metrics:** Every notebook reports `MAE`, `RMSE`, `sMAPE (%)`, wall-clock `Fit Time (s)`, and scale-free error relative to pre-test naive persistence (`MASE` for Bike Sharing and Electricity Load; `RMSSE` for M5 Retail Sales).
+- **Foundation Model Contamination Disclosure:** The official `Chronos` pretraining corpus includes the Monash Time Series Forecasting Archive (which contains Portuguese Electricity Load, Capital Bikeshare subsets, and M5 subsets). Accordingly, `Chronos-Bolt` results are explicitly labeled in every notebook as **in-distribution zero-shot recall / adaptation** rather than strictly blind out-of-distribution transfer.
 
-Code is organized using `darts` to maintain a consistent interface across classical and neural models, alongside `neuralforecast` for fast, GPU-accelerated training of DLinear, N-BEATS, and NHITS. All runs are controlled by YAML configuration files with fixed random seeds for easy reproduction. The deliverables include the core Python benchmarking pipeline, an interactive results notebook, and a lightweight Streamlit and FastAPI demo for running live forecasts and inspecting forecast plots and latency numbers.
+---
+
+## Roadmap & Planned Extensions
+
+- **Codebase Modularization:** Extract shared Tier 1–4 training, evaluation, and plotting routines from the three standalone Colab notebooks into a reusable `src/` Python package.
+- **Multi-Step Horizon Decay ($h > 1$):** Add free-running multi-horizon evaluation ($h=24$ hours / $h=28$ days without intermediate $y_{t-1}$ updates) to map where model error converges toward `Seasonal Naive`.
+- **Disaggregate Cross-Series M5:** Extend M5 from national aggregate demand to global cross-series training (`LightGBM`, `NHITS`, `DeepAR`) across item/store hierarchies evaluated with official `WRMSSE` and quantile pinball loss.
+- **Statistical Significance & Ablations:** Add Diebold–Mariano tests, lookback sensitivity curves, and input-shuffling ablations.
