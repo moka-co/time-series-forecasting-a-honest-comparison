@@ -187,3 +187,6 @@ cython_debug/
 # Task tracking
 task.md
 tasks.md
+
+# StatsForecast cross-validation cache
+cache/
